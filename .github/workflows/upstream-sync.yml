@@ -1,0 +1,84 @@
+name: 上游自动同步（保留上游删除文件）
+
+on:
+  schedule:
+    # 每天 02:00 UTC（北京时间 10:00）
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-sync-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: 同步上游并保护本地修改
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出完整 Git 历史
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: 获取上游更新
+        env:
+          UPSTREAM_REPO: cyberdaddyleo/workstation-HR
+          UPSTREAM_BRANCH: main
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --no-tags upstream "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
+          echo "UPSTREAM_REF=refs/remotes/upstream/${UPSTREAM_BRANCH}" >> "$GITHUB_ENV"
+
+      - name: 合并更新并恢复上游删除的文件
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PRE_SYNC_HEAD="$(git rev-parse HEAD)"
+          BASE="$(git merge-base "$PRE_SYNC_HEAD" "$UPSTREAM_REF")"
+
+          # 记录上游相对共同祖先删除的文件（使用 NUL 分隔，兼容特殊文件名）
+          mapfile -d '' DELETED_PATHS < <(git diff --name-only -z --diff-filter=D "$BASE" "$UPSTREAM_REF")
+
+          # 冲突时优先保留本仓库版本；无法自动解决时中止，不强推
+          if ! git merge --no-ff --no-commit -X ours "$UPSTREAM_REF"; then
+            if [[ -n "$(git ls-files -u)" ]]; then
+              git merge --abort || true
+              echo "::error::存在无法自动解决的冲突，已中止同步，未推送更改。"
+              exit 1
+            fi
+            git merge --abort || true
+            echo "::error::合并失败，已中止同步。"
+            exit 1
+          fi
+
+          RESTORED=0
+          for path in "${DELETED_PATHS[@]}"; do
+            # 只恢复同步前本仓库确实存在、且合并结果中已消失的文件。
+            # 如果你之前已经自行删除该文件，则不会擅自恢复。
+            if git cat-file -e "${PRE_SYNC_HEAD}:${path}" 2>/dev/null \
+              && ! git cat-file -e ":${path}" 2>/dev/null; then
+              git restore --source="$PRE_SYNC_HEAD" --staged --worktree -- "$path"
+              RESTORED=$((RESTORED + 1))
+            fi
+          done
+
+          git add -A
+          if ! git diff --cached --quiet; then
+            git -c user.name="github-actions[bot]" \
+                -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                commit -m "Sync upstream cyberdaddyleo/workstation-HR (preserve upstream-deleted files)"
+          else
+            echo "上游没有需要应用的新改动。"
+          fi
+
+          echo "已保留上游删除、但本仓库原本存在的文件数：${RESTORED}"
+
+      - name: 推送同步结果
+        run: git push origin HEAD:main
